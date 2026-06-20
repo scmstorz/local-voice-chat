@@ -6,13 +6,53 @@ Lokaler Voice-Chat-Prototyp:
 
 ## Voraussetzungen
 
+- macOS auf einem Mac mit Apple Silicon ist empfohlen
 - Ollama läuft lokal auf `http://localhost:11434`
 - Ein Chat-Modell ist in Ollama installiert, hier voreingestellt: `qwen3.6:latest`
+- Xcode Command Line Tools sind installiert, damit Swift-Helper gebaut werden können
 - `ffmpeg` ist installiert
 - macOS `say` ist vorhanden für die erste TTS-Version
 - Optional: `mlx-whisper`/`mlx_whisper` ist in der Python-Umgebung installiert
 
-## Setup
+## Installation auf einem MacBook
+
+### 1. Repository auschecken
+
+```bash
+git clone https://github.com/scmstorz/local-voice-chat.git
+cd local-voice-chat
+```
+
+### 2. System-Tools installieren
+
+Falls noch nicht vorhanden:
+
+```bash
+xcode-select --install
+```
+
+Mit Homebrew:
+
+```bash
+brew install ollama ffmpeg
+```
+
+Ollama starten:
+
+```bash
+ollama serve
+```
+
+In einem zweiten Terminal das Chat-Modell laden. Der Default dieses Projekts ist:
+
+```bash
+ollama pull qwen3.6:latest
+```
+
+Wenn du dieses Modell nicht hast, nimm ein anderes lokales Ollama-Modell und setze
+später `OLLAMA_MODEL` in `.env`.
+
+### 3. Python-Umgebung einrichten
 
 ```bash
 /usr/bin/python3 -m venv .venv
@@ -22,7 +62,54 @@ python -m pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Passe in `.env` mindestens `OLLAMA_MODEL` an den Namen aus `ollama list` an.
+Prüfe deine Ollama-Modellnamen:
+
+```bash
+ollama list
+```
+
+Passe in `.env` mindestens `OLLAMA_MODEL` an, falls dein Modell anders heißt.
+
+### 4. Apple-STT-Helper bauen
+
+```bash
+bash scripts/build_apple_stt.sh
+```
+
+Danach sollten diese Dateien existieren:
+
+```text
+bin/apple_stt
+bin/apple_live_stt
+```
+
+### 5. Deutsche lokale Apple-STT prüfen
+
+```bash
+bin/apple_stt --check --locale de-DE --timeout 10
+```
+
+Gutes Ergebnis:
+
+```text
+recognizer=yes locale=de-DE available=true
+```
+
+Wenn macOS nach Berechtigungen fragt, erlauben. Falls der Check danach weiterhin
+mit `authorization failed with status denied` scheitert:
+
+```text
+System Settings -> Privacy & Security -> Speech Recognition
+```
+
+Dort Terminal, iTerm, Python oder die App aktivieren, aus der du
+`python server/app.py` startest.
+
+Für den Live-STT-Modus braucht dieselbe App zusätzlich Mikrofonrechte:
+
+```text
+System Settings -> Privacy & Security -> Microphone
+```
 
 ## Start
 
@@ -46,6 +133,30 @@ sessions/yyyy-mm-dd-hh-mm-ss.txt
 ```
 
 Darin stehen alle Nutzerfragen und Assistentenantworten dieser Sitzung.
+
+## Standard-Konfiguration für Deutsch
+
+Die wichtigsten Defaults aus `.env.example`:
+
+```env
+OLLAMA_MODEL=qwen3.6:latest
+OLLAMA_DISABLE_THINKING=1
+STT_PROVIDER=apple
+STT_LANGUAGE=de
+APPLE_STT_BINARY=bin/apple_stt
+APPLE_LIVE_STT_BINARY=bin/apple_live_stt
+TTS_VOICE=
+```
+
+`STT_PROVIDER=apple` ist der lokale deutsche Standard: Apple Speech Framework,
+On-Device-Erkennung erzwungen, Live-Interims über `bin/apple_live_stt`.
+
+`TTS_VOICE=` bedeutet: macOS verwendet die aktuelle Systemstimme. Die Ausgabe
+läuft über `say` lokal. Wenn du eine bestimmte installierte Stimme willst:
+
+```env
+TTS_VOICE=Anna
+```
 
 ## Transkription
 
@@ -102,6 +213,40 @@ System Settings -> Privacy & Security -> Speech Recognition
 
 Dort Terminal, iTerm, Python oder die App aktivieren, aus der `python server/app.py`
 gestartet wird. Das ist getrennt von der Browser-Mikrofonberechtigung.
+
+### Deutsche Besonderheiten
+
+- `STT_LANGUAGE=de` wird intern zu `de-DE`.
+- Lokale Browser-STT für Deutsch kann mit `language-not-supported` fehlschlagen.
+  Das ist der Grund, warum der Standard nicht Web-Speech, sondern Apple
+  `Speech.framework` ist.
+- Apple On-Device-STT ist lokal, aber nur verfügbar, wenn macOS den deutschen
+  Recognizer lokal unterstützt. Der Preflight oben prüft das.
+- Die Browser-Mikrofonberechtigung reicht für den Apple-Live-Modus nicht aus.
+  Terminal/iTerm/Python braucht ebenfalls Mikrofon- und Speech-Recognition-Rechte.
+
+### English Setup
+
+For English speech recognition, change `.env`:
+
+```env
+STT_LANGUAGE=en
+SYSTEM_PROMPT=You are a local voice chat assistant. Answer briefly and directly in the user's language. Output only the final answer.
+```
+
+`STT_LANGUAGE=en` is mapped internally to `en-US`.
+
+Check Apple on-device English STT:
+
+```bash
+bin/apple_stt --check --locale en-US --timeout 10
+```
+
+Expected:
+
+```text
+recognizer=yes locale=en-US available=true
+```
 
 `STT_PROVIDER=browser` nutzt die Web-Speech-API mit Live-Interim-Resultaten.
 Das ist deutlich interaktiver, weil nicht erst die komplette Audiodatei an den
