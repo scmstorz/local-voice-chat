@@ -8,8 +8,14 @@ const recordLabel = document.querySelector("#recordLabel");
 const resetBtn = document.querySelector("#resetBtn");
 
 let recorder = null;
+let recognition = null;
 let chunks = [];
 let busy = false;
+let config = {
+  stt_provider: "browser",
+  stt_language: "de",
+};
+let liveTranscriptEl = null;
 
 showEmptyState();
 loadConfig();
@@ -29,23 +35,100 @@ textForm.addEventListener("submit", async (event) => {
 
 recordBtn.addEventListener("click", async () => {
   if (busy) return;
+  if (recognition) {
+    recognition.stop();
+    return;
+  }
   if (recorder?.state === "recording") {
     recorder.stop();
     return;
   }
-  await startRecording();
+  if (config.stt_provider === "browser" && browserSpeechSupported()) {
+    startBrowserSpeechRecognition();
+  } else {
+    await startRecording();
+  }
 });
 
 async function loadConfig() {
   try {
     const res = await fetch("/api/config");
-    const config = await res.json();
+    config = { ...config, ...(await res.json()) };
     const model = config.ollama_model || "unbekannt";
     const ollama = config.ollama_ok ? "Ollama verbunden" : "Ollama nicht erreichbar";
-    statusEl.textContent = `${ollama} · Modell: ${model}`;
+    const stt = config.stt_provider === "browser" && browserSpeechSupported() ? "Live-STT im Browser" : "MLX-Whisper";
+    statusEl.textContent = `${ollama} · Modell: ${model} · ${stt}`;
   } catch (error) {
     statusEl.textContent = "Server erreichbar, Konfiguration konnte nicht geladen werden";
   }
+}
+
+function browserSpeechSupported() {
+  return Boolean(window.SpeechRecognition || window.webkitSpeechRecognition);
+}
+
+function startBrowserSpeechRecognition() {
+  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  recognition = new SpeechRecognition();
+  recognition.lang = normalizeSpeechLanguage(config.stt_language);
+  recognition.continuous = false;
+  recognition.interimResults = true;
+  recognition.maxAlternatives = 1;
+
+  let finalText = "";
+  let interimText = "";
+  liveTranscriptEl = addMessage("system", "Hoere zu...");
+  recordBtn.classList.add("recording");
+  recordLabel.textContent = "Stoppen";
+
+  recognition.addEventListener("result", (event) => {
+    interimText = "";
+    for (let i = event.resultIndex; i < event.results.length; i += 1) {
+      const result = event.results[i];
+      const text = result[0]?.transcript || "";
+      if (result.isFinal) {
+        finalText += `${text} `;
+      } else {
+        interimText += text;
+      }
+    }
+    liveTranscriptEl.textContent = (finalText + interimText).trim() || "Hoere zu...";
+  });
+
+  recognition.addEventListener("error", async (event) => {
+    const message = event.error ? `Browser-STT Fehler: ${event.error}` : "Browser-STT Fehler";
+    cleanupBrowserSpeech();
+    liveTranscriptEl?.remove();
+    addMessage("system", `${message}. Fallback: Audioaufnahme verwenden.`);
+    await startRecording();
+  });
+
+  recognition.addEventListener("end", async () => {
+    const transcript = (finalText + interimText).trim();
+    cleanupBrowserSpeech();
+    liveTranscriptEl?.remove();
+    liveTranscriptEl = null;
+    if (transcript) {
+      await sendText(transcript);
+    } else {
+      addMessage("system", "Keine Sprache erkannt.");
+    }
+  });
+
+  recognition.start();
+}
+
+function cleanupBrowserSpeech() {
+  recognition = null;
+  recordBtn.classList.remove("recording");
+  recordLabel.textContent = "Gedrückt starten";
+}
+
+function normalizeSpeechLanguage(language) {
+  if (!language) return "de-DE";
+  if (language === "de") return "de-DE";
+  if (language === "en") return "en-US";
+  return language;
 }
 
 async function startRecording() {
@@ -82,6 +165,7 @@ function pickMimeType() {
 async function sendText(message) {
   setBusy(true);
   addMessage("user", message);
+  const thinkingEl = addMessage("system", "Generiere Antwort...");
   try {
     const res = await fetch("/api/chat", {
       method: "POST",
@@ -89,9 +173,11 @@ async function sendText(message) {
       body: JSON.stringify({ message }),
     });
     const data = await readJson(res);
+    thinkingEl.remove();
     addMessage("assistant", data.response);
     playAudio(data);
   } catch (error) {
+    thinkingEl.remove();
     addMessage("system", error.message);
   } finally {
     setBusy(false);
@@ -139,6 +225,7 @@ function addMessage(role, text) {
   el.textContent = text;
   messagesEl.append(el);
   messagesEl.scrollTop = messagesEl.scrollHeight;
+  return el;
 }
 
 function showEmptyState() {

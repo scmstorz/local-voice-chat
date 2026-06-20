@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -40,7 +41,29 @@ load_env(ROOT / ".env")
 class Settings:
     ollama_base_url: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
     ollama_model: str = os.getenv("OLLAMA_MODEL", "qwen3.6:latest")
+    ollama_keep_alive: str = os.getenv("OLLAMA_KEEP_ALIVE", "30m").strip()
+    ollama_num_predict: int = int(os.getenv("OLLAMA_NUM_PREDICT", "256"))
+    ollama_num_ctx: int = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
+    ollama_temperature: float = float(os.getenv("OLLAMA_TEMPERATURE", "0.4"))
+    ollama_disable_thinking: bool = os.getenv("OLLAMA_DISABLE_THINKING", "1").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
     whisper_model: str = os.getenv("WHISPER_MODEL", "mlx-community/whisper-large-v3-mlx")
+    stt_provider: str = os.getenv("STT_PROVIDER", "browser").strip().lower()
+    stt_language: str = os.getenv("STT_LANGUAGE", "").strip()
+    stt_fp16: bool = os.getenv("STT_FP16", "1").strip().lower() in {"1", "true", "yes", "on"}
+    stt_temperature: float = float(os.getenv("STT_TEMPERATURE", "0"))
+    stt_condition_on_previous_text: bool = os.getenv("STT_CONDITION_ON_PREVIOUS_TEXT", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    stt_offline: bool = os.getenv("STT_OFFLINE", "0").strip().lower() in {"1", "true", "yes", "on"}
+    stt_disable_progress: bool = os.getenv("STT_DISABLE_PROGRESS", "1").strip().lower() in {"1", "true", "yes", "on"}
     stt_command: str = os.getenv("STT_COMMAND", "").strip()
     system_prompt: str = os.getenv(
         "SYSTEM_PROMPT",
@@ -110,12 +133,25 @@ class VoiceChatHandler(BaseHTTPRequestHandler):
             tmp = Path(tmp_dir)
             raw_path = tmp / f"input{suffix}"
             raw_path.write_bytes(audio_bytes)
+            started = time.perf_counter()
             wav_path = normalize_audio(raw_path, tmp / "input.wav")
+            converted_at = time.perf_counter()
             transcript = transcribe_audio(wav_path).strip()
+            transcribed_at = time.perf_counter()
             if not transcript:
                 raise HttpError(HTTPStatus.UNPROCESSABLE_ENTITY, "No speech was transcribed.")
             assistant_text = ask_ollama(transcript)
+            answered_at = time.perf_counter()
             audio = synthesize_speech(assistant_text, tmp)
+            finished_at = time.perf_counter()
+            print(
+                "voice timings: "
+                f"convert={converted_at - started:.2f}s "
+                f"stt={transcribed_at - converted_at:.2f}s "
+                f"ollama={answered_at - transcribed_at:.2f}s "
+                f"tts={finished_at - answered_at:.2f}s "
+                f"total={finished_at - started:.2f}s"
+            )
             self.send_json(chat_response(transcript, assistant_text, audio))
 
     def read_body(self) -> bytes:
@@ -196,6 +232,10 @@ def health() -> dict[str, Any]:
         "ok": True,
         "ollama_base_url": settings.ollama_base_url,
         "ollama_model": settings.ollama_model,
+        "ollama_keep_alive": settings.ollama_keep_alive,
+        "ollama_num_predict": settings.ollama_num_predict,
+        "ollama_num_ctx": settings.ollama_num_ctx,
+        "ollama_disable_thinking": settings.ollama_disable_thinking,
         "ffmpeg": bool(shutil.which("ffmpeg")),
         "say": bool(shutil.which("say")),
         "afconvert": bool(shutil.which("afconvert")),
@@ -214,8 +254,16 @@ def config() -> dict[str, Any]:
     return {
         "ollama_ok": ollama_ok,
         "ollama_model": settings.ollama_model,
+        "ollama_keep_alive": settings.ollama_keep_alive,
+        "ollama_num_predict": settings.ollama_num_predict,
+        "ollama_num_ctx": settings.ollama_num_ctx,
+        "ollama_disable_thinking": settings.ollama_disable_thinking,
         "available_models": models,
         "whisper_model": settings.whisper_model,
+        "stt_provider": settings.stt_provider,
+        "stt_language": settings.stt_language,
+        "stt_offline": settings.stt_offline,
+        "stt_disable_progress": settings.stt_disable_progress,
         "stt_command_configured": bool(settings.stt_command),
     }
 
@@ -263,6 +311,8 @@ def normalize_audio(input_path: Path, output_path: Path) -> Path:
 
 
 def transcribe_audio(audio_path: Path) -> str:
+    configure_stt_environment()
+
     if settings.stt_command:
         return run_stt_command(audio_path)
 
@@ -271,12 +321,24 @@ def transcribe_audio(audio_path: Path) -> str:
     except Exception as exc:
         raise HttpError(
             HTTPStatus.INTERNAL_SERVER_ERROR,
-            "mlx_whisper is not installed in this Python environment. Install it or set STT_COMMAND in .env. "
+            "mlx_whisper is not installed in the Python environment that runs the server. "
+            "Either install it with `python3 -m pip install mlx-whisper`, or set STT_COMMAND in .env "
+            "to a Python interpreter where it is installed, for example: "
+            "`STT_COMMAND=/path/to/python scripts/transcribe_mlx.py {file}`. "
             f"Import error: {exc}",
         ) from exc
 
     try:
-        result = mlx_whisper.transcribe(str(audio_path), path_or_hf_repo=settings.whisper_model)
+        kwargs = {
+            "path_or_hf_repo": settings.whisper_model,
+            "fp16": settings.stt_fp16,
+            "temperature": settings.stt_temperature,
+            "condition_on_previous_text": settings.stt_condition_on_previous_text,
+            "verbose": None,
+        }
+        if settings.stt_language:
+            kwargs["language"] = settings.stt_language
+        result = mlx_whisper.transcribe(str(audio_path), **kwargs)
     except TypeError:
         result = mlx_whisper.transcribe(str(audio_path), settings.whisper_model)
     except Exception as exc:
@@ -295,16 +357,35 @@ def run_stt_command(audio_path: Path) -> str:
     return proc.stdout.strip()
 
 
+def configure_stt_environment() -> None:
+    if settings.stt_offline:
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    if settings.stt_disable_progress:
+        os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+        os.environ["HF_HUB_VERBOSITY"] = "error"
+
+
 def ask_ollama(user_text: str) -> str:
-    messages.append({"role": "user", "content": user_text})
+    user_message = build_user_message(user_text)
+    messages.append({"role": "user", "content": user_message})
     payload = {
         "model": settings.ollama_model,
         "messages": messages,
         "stream": False,
-        "options": {"temperature": 0.7},
+        "keep_alive": settings.ollama_keep_alive,
+        "options": {
+            "temperature": settings.ollama_temperature,
+            "num_predict": settings.ollama_num_predict,
+            "num_ctx": settings.ollama_num_ctx,
+        },
     }
+    if settings.ollama_disable_thinking:
+        payload["think"] = False
     try:
+        started = time.perf_counter()
         data = ollama_request("/api/chat", payload, timeout=120)
+        finished = time.perf_counter()
     except Exception as exc:
         messages.pop()
         raise HttpError(HTTPStatus.BAD_GATEWAY, f"Could not get Ollama response: {exc}") from exc
@@ -312,11 +393,50 @@ def ask_ollama(user_text: str) -> str:
     assistant_text = extract_assistant_text(data).strip()
     if not assistant_text:
         messages.pop()
-        raise HttpError(HTTPStatus.BAD_GATEWAY, f"Ollama returned no assistant text: {json.dumps(data)[:800]}")
+        thinking = extract_assistant_thinking(data).strip()
+        hint = ""
+        if thinking:
+            hint = (
+                " The model returned only thinking text. For Qwen thinking models, keep "
+                "OLLAMA_DISABLE_THINKING=1 or increase OLLAMA_NUM_PREDICT."
+            )
+        raise HttpError(HTTPStatus.BAD_GATEWAY, f"Ollama returned no assistant text.{hint} Raw: {json.dumps(data)[:800]}")
 
     messages.append({"role": "assistant", "content": assistant_text})
     trim_history()
+    print_ollama_timing(data, finished - started)
     return assistant_text
+
+
+def build_user_message(user_text: str) -> str:
+    if not settings.ollama_disable_thinking:
+        return user_text
+    return f"{user_text}\n\n/no_think"
+
+
+def print_ollama_timing(data: dict[str, Any], wall_time: float) -> None:
+    eval_count = int(data.get("eval_count") or 0)
+    eval_duration = int(data.get("eval_duration") or 0)
+    load_duration = int(data.get("load_duration") or 0)
+    prompt_eval_count = int(data.get("prompt_eval_count") or 0)
+    prompt_eval_duration = int(data.get("prompt_eval_duration") or 0)
+
+    eval_tps = eval_count / (eval_duration / 1_000_000_000) if eval_count and eval_duration else 0.0
+    prompt_tps = (
+        prompt_eval_count / (prompt_eval_duration / 1_000_000_000)
+        if prompt_eval_count and prompt_eval_duration
+        else 0.0
+    )
+
+    print(
+        "ollama timings: "
+        f"wall={wall_time:.2f}s "
+        f"load={load_duration / 1_000_000_000:.2f}s "
+        f"prompt_tokens={prompt_eval_count} "
+        f"prompt_tps={prompt_tps:.1f} "
+        f"eval_tokens={eval_count} "
+        f"eval_tps={eval_tps:.1f}"
+    )
 
 
 def ollama_request(path: str, payload: dict[str, Any] | None, timeout: int) -> dict[str, Any]:
@@ -340,6 +460,13 @@ def extract_assistant_text(data: dict[str, Any]) -> str:
     if isinstance(message, dict):
         return str(message.get("content", ""))
     return str(data.get("response", ""))
+
+
+def extract_assistant_thinking(data: dict[str, Any]) -> str:
+    message = data.get("message")
+    if isinstance(message, dict):
+        return str(message.get("thinking", ""))
+    return str(data.get("thinking", ""))
 
 
 def trim_history(max_non_system_messages: int = 16) -> None:
