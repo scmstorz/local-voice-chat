@@ -5,6 +5,8 @@ __pycache__/
 .venv/
 venv/
 env/
+bin/
+sessions/*.txt
 
 # Runtime artifacts
 *.wav

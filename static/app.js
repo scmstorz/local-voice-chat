@@ -9,11 +9,14 @@ const resetBtn = document.querySelector("#resetBtn");
 
 let recorder = null;
 let recognition = null;
+let appleLiveSource = null;
+let appleLiveTranscript = "";
 let chunks = [];
 let busy = false;
 let config = {
   stt_provider: "browser",
   stt_language: "de",
+  browser_stt_local: true,
 };
 let liveTranscriptEl = null;
 
@@ -35,6 +38,10 @@ textForm.addEventListener("submit", async (event) => {
 
 recordBtn.addEventListener("click", async () => {
   if (busy) return;
+  if (appleLiveSource) {
+    await stopAppleLiveRecognition();
+    return;
+  }
   if (recognition) {
     recognition.stop();
     return;
@@ -45,6 +52,8 @@ recordBtn.addEventListener("click", async () => {
   }
   if (config.stt_provider === "browser" && browserSpeechSupported()) {
     startBrowserSpeechRecognition();
+  } else if (config.stt_provider === "apple") {
+    await startAppleLiveRecognition();
   } else {
     await startRecording();
   }
@@ -56,7 +65,7 @@ async function loadConfig() {
     config = { ...config, ...(await res.json()) };
     const model = config.ollama_model || "unbekannt";
     const ollama = config.ollama_ok ? "Ollama verbunden" : "Ollama nicht erreichbar";
-    const stt = config.stt_provider === "browser" && browserSpeechSupported() ? "Live-STT im Browser" : "MLX-Whisper";
+    const stt = sttStatusText();
     statusEl.textContent = `${ollama} · Modell: ${model} · ${stt}`;
   } catch (error) {
     statusEl.textContent = "Server erreichbar, Konfiguration konnte nicht geladen werden";
@@ -67,17 +76,102 @@ function browserSpeechSupported() {
   return Boolean(window.SpeechRecognition || window.webkitSpeechRecognition);
 }
 
+function sttStatusText() {
+  if (config.stt_provider === "apple") return "Apple Live On-Device STT";
+  if (config.stt_provider === "browser" && browserSpeechSupported()) {
+    return config.browser_stt_local ? "Lokale Browser-STT bevorzugt" : "Live-STT im Browser";
+  }
+  return "MLX-Whisper";
+}
+
+async function startAppleLiveRecognition() {
+  try {
+    const res = await fetch("/api/apple-live/start", { method: "POST" });
+    await readJson(res);
+  } catch (error) {
+    addMessage("system", `Apple Live-STT konnte nicht starten: ${error.message}`);
+    return;
+  }
+
+  appleLiveTranscript = "";
+  liveTranscriptEl = addMessage("system", "Hoere lokal zu...");
+  recordBtn.classList.add("recording");
+  recordLabel.textContent = "Stoppen";
+
+  appleLiveSource = new EventSource("/api/apple-live/events");
+  appleLiveSource.addEventListener("message", (event) => {
+    let data = null;
+    try {
+      data = JSON.parse(event.data);
+    } catch (error) {
+      liveTranscriptEl.textContent = event.data || "Hoere lokal zu...";
+      return;
+    }
+
+    if (data.type === "ready") {
+      liveTranscriptEl.textContent = "Hoere lokal zu...";
+    } else if (data.type === "partial" || data.type === "final") {
+      appleLiveTranscript = (data.text || "").trim();
+      liveTranscriptEl.textContent = appleLiveTranscript || "Hoere lokal zu...";
+    } else if (data.type === "error") {
+      liveTranscriptEl.textContent = `Apple Live-STT Fehler: ${data.text}`;
+    }
+  });
+
+  appleLiveSource.addEventListener("error", () => {
+    if (appleLiveSource) {
+      addMessage("system", "Apple Live-STT Verbindung wurde beendet.");
+    }
+  });
+}
+
+async function stopAppleLiveRecognition() {
+  const transcript = appleLiveTranscript.trim();
+  cleanupAppleLiveRecognition();
+  try {
+    await fetch("/api/apple-live/stop", { method: "POST" });
+  } catch (error) {
+    addMessage("system", `Apple Live-STT konnte nicht gestoppt werden: ${error.message}`);
+  }
+
+  liveTranscriptEl?.remove();
+  liveTranscriptEl = null;
+
+  if (transcript) {
+    await sendText(transcript);
+  } else {
+    addMessage("system", "Keine Sprache erkannt.");
+  }
+}
+
+function cleanupAppleLiveRecognition() {
+  appleLiveSource?.close();
+  appleLiveSource = null;
+  appleLiveTranscript = "";
+  recordBtn.classList.remove("recording");
+  recordLabel.textContent = "Gedrückt starten";
+}
+
 function startBrowserSpeechRecognition() {
+  startBrowserSpeechRecognitionWithMode(Boolean(config.browser_stt_local));
+}
+
+function startBrowserSpeechRecognitionWithMode(processLocally) {
   const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
   recognition = new SpeechRecognition();
   recognition.lang = normalizeSpeechLanguage(config.stt_language);
   recognition.continuous = false;
   recognition.interimResults = true;
   recognition.maxAlternatives = 1;
+  if ("processLocally" in recognition) {
+    recognition.processLocally = processLocally;
+  } else if (processLocally) {
+    addMessage("system", "Lokale Browser-STT wird von diesem Browser nicht angeboten. Nutze Browser-STT.");
+  }
 
   let finalText = "";
   let interimText = "";
-  liveTranscriptEl = addMessage("system", "Hoere zu...");
+  liveTranscriptEl = addMessage("system", processLocally ? "Hoere lokal zu..." : "Hoere zu...");
   recordBtn.classList.add("recording");
   recordLabel.textContent = "Stoppen";
 
@@ -96,11 +190,18 @@ function startBrowserSpeechRecognition() {
   });
 
   recognition.addEventListener("error", async (event) => {
-    const message = event.error ? `Browser-STT Fehler: ${event.error}` : "Browser-STT Fehler";
+    const error = event.error || "";
+    const message = error ? `Browser-STT Fehler: ${error}` : "Browser-STT Fehler";
     cleanupBrowserSpeech();
     liveTranscriptEl?.remove();
-    addMessage("system", `${message}. Fallback: Audioaufnahme verwenden.`);
-    await startRecording();
+    liveTranscriptEl = null;
+    if (processLocally) {
+      addMessage("system", `${message}. Lokale STT nicht verfuegbar, versuche Browser-STT.`);
+      startBrowserSpeechRecognitionWithMode(false);
+    } else {
+      addMessage("system", `${message}. Fallback: Audioaufnahme verwenden.`);
+      await startRecording();
+    }
   });
 
   recognition.addEventListener("end", async () => {

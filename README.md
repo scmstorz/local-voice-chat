@@ -39,6 +39,14 @@ Falls der Port belegt ist, nimmt er automatisch den nächsten freien Port.
 http://127.0.0.1:8000
 ```
 
+Pro Serverstart wird ein Session-Log angelegt:
+
+```text
+sessions/yyyy-mm-dd-hh-mm-ss.txt
+```
+
+Darin stehen alle Nutzerfragen und Assistentenantworten dieser Sitzung.
+
 ## Transkription
 
 Standardmäßig versucht der Server:
@@ -51,13 +59,49 @@ mlx_whisper.transcribe(...)
 Der voreingestellte Voice-Chat-Default ist schnell statt maximal genau:
 
 ```env
-STT_PROVIDER=browser
+STT_PROVIDER=apple
 WHISPER_MODEL=mlx-community/whisper-tiny
 STT_LANGUAGE=de
+BROWSER_STT_LOCAL=1
+APPLE_STT_BINARY=bin/apple_stt
+APPLE_STT_TIMEOUT=60
 STT_FP16=1
 STT_TEMPERATURE=0
 STT_CONDITION_ON_PREVIOUS_TEXT=0
 ```
+
+`STT_PROVIDER=apple` nutzt einen kleinen Swift-Helper mit Apples
+`Speech.framework`. Der Helper setzt `requiresOnDeviceRecognition = true`.
+Wenn deutsche On-Device-Erkennung nicht verfügbar ist, schlägt die Transkription
+fehl statt auf Cloud-STT zurückzufallen. Beim ersten Start kann macOS nach
+Speech-Recognition-Berechtigung für Terminal/Python fragen.
+
+Im Apple-Modus nutzt die UI den Streaming-Helper `bin/apple_live_stt`: Der Helper
+nimmt das Mac-Mikrofon direkt auf und streamt partielle Transkripte an den
+Browser. Beim Stop wird der letzte erkannte Text an Ollama geschickt. Dafuer
+braucht die startende App, also Terminal/iTerm/Python, sowohl Mikrofon- als auch
+Speech-Recognition-Rechte.
+
+Der Helper wird bei der ersten Verwendung automatisch gebaut. Manuell:
+
+```bash
+bash scripts/build_apple_stt.sh
+```
+
+Preflight fuer Berechtigung und deutsche Recognizer-Verfuegbarkeit:
+
+```bash
+bin/apple_stt --check --locale de-DE --timeout 10
+```
+
+Wenn `authorization failed with status denied` erscheint, in macOS oeffnen:
+
+```text
+System Settings -> Privacy & Security -> Speech Recognition
+```
+
+Dort Terminal, iTerm, Python oder die App aktivieren, aus der `python server/app.py`
+gestartet wird. Das ist getrennt von der Browser-Mikrofonberechtigung.
 
 `STT_PROVIDER=browser` nutzt die Web-Speech-API mit Live-Interim-Resultaten.
 Das ist deutlich interaktiver, weil nicht erst die komplette Audiodatei an den
@@ -65,10 +109,21 @@ Server geschickt und mit Whisper transkribiert werden muss. Wenn der Browser die
 API nicht bereitstellt, fällt die Oberfläche automatisch auf den MLX-Whisper-Pfad
 zurück.
 
+`BROWSER_STT_LOCAL=1` setzt, falls vom Browser unterstützt,
+`SpeechRecognition.processLocally = true`. Wenn der Browser lokale STT oder das
+benötigte Sprachpaket nicht bereitstellt, fällt die Oberfläche auf normale
+Browser-STT zurück und zeigt das im Chat an.
+
 Wenn du explizit MLX-Whisper erzwingen willst:
 
 ```env
 STT_PROVIDER=mlx
+```
+
+Wenn du explizit Browser-STT erzwingen willst:
+
+```env
+STT_PROVIDER=browser
 ```
 
 Für bessere Genauigkeit, aber höhere Latenz:

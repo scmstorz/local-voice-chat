@@ -9,10 +9,12 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -21,6 +23,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 STATIC_DIR = ROOT / "static"
+SESSIONS_DIR = ROOT / "sessions"
 
 
 def load_env(path: Path) -> None:
@@ -54,6 +57,11 @@ class Settings:
     whisper_model: str = os.getenv("WHISPER_MODEL", "mlx-community/whisper-large-v3-mlx")
     stt_provider: str = os.getenv("STT_PROVIDER", "browser").strip().lower()
     stt_language: str = os.getenv("STT_LANGUAGE", "").strip()
+    browser_stt_local: bool = os.getenv("BROWSER_STT_LOCAL", "1").strip().lower() in {"1", "true", "yes", "on"}
+    apple_stt_binary: str = os.getenv("APPLE_STT_BINARY", "bin/apple_stt").strip()
+    apple_live_stt_binary: str = os.getenv("APPLE_LIVE_STT_BINARY", "bin/apple_live_stt").strip()
+    apple_stt_timeout: int = int(os.getenv("APPLE_STT_TIMEOUT", "60"))
+    apple_live_stt_timeout: int = int(os.getenv("APPLE_LIVE_STT_TIMEOUT", "300"))
     stt_fp16: bool = os.getenv("STT_FP16", "1").strip().lower() in {"1", "true", "yes", "on"}
     stt_temperature: float = float(os.getenv("STT_TEMPERATURE", "0"))
     stt_condition_on_previous_text: bool = os.getenv("STT_CONDITION_ON_PREVIOUS_TEXT", "0").strip().lower() in {
@@ -77,6 +85,11 @@ class Settings:
 
 settings = Settings()
 messages: list[dict[str, str]] = [{"role": "system", "content": settings.system_prompt}]
+live_stt_lock = threading.Lock()
+live_stt_process: subprocess.Popen[str] | None = None
+session_log_lock = threading.Lock()
+session_started_at = datetime.now()
+session_log_path = SESSIONS_DIR / f"{session_started_at:%Y-%m-%d-%H-%M-%S}.txt"
 
 
 class HttpError(Exception):
@@ -100,6 +113,8 @@ class VoiceChatHandler(BaseHTTPRequestHandler):
                 self.send_json(health())
             elif self.path == "/api/config":
                 self.send_json(config())
+            elif self.path == "/api/apple-live/events":
+                self.handle_apple_live_events()
             else:
                 self.send_error_json(HTTPStatus.NOT_FOUND, "Not found.")
         except HttpError as exc:
@@ -120,6 +135,10 @@ class VoiceChatHandler(BaseHTTPRequestHandler):
             elif self.path == "/api/voice":
                 audio_bytes, filename, content_type = self.read_multipart_file("audio")
                 self.handle_voice(audio_bytes, filename, content_type)
+            elif self.path == "/api/apple-live/start":
+                self.send_json(start_apple_live_stt())
+            elif self.path == "/api/apple-live/stop":
+                self.send_json(stop_apple_live_stt())
             else:
                 self.send_error_json(HTTPStatus.NOT_FOUND, "Not found.")
         except HttpError as exc:
@@ -153,6 +172,30 @@ class VoiceChatHandler(BaseHTTPRequestHandler):
                 f"total={finished_at - started:.2f}s"
             )
             self.send_json(chat_response(transcript, assistant_text, audio))
+
+    def handle_apple_live_events(self) -> None:
+        process = current_live_stt_process()
+        if process is None or process.stdout is None:
+            raise HttpError(HTTPStatus.CONFLICT, "Apple live STT is not running.")
+
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+
+        try:
+            for line in process.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                self.wfile.write(f"data: {line}\n\n".encode("utf-8"))
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            if process.poll() is not None:
+                clear_live_stt_process(process)
 
     def read_body(self) -> bytes:
         length = int(self.headers.get("Content-Length", "0"))
@@ -262,6 +305,11 @@ def config() -> dict[str, Any]:
         "whisper_model": settings.whisper_model,
         "stt_provider": settings.stt_provider,
         "stt_language": settings.stt_language,
+        "browser_stt_local": settings.browser_stt_local,
+        "apple_stt_binary": settings.apple_stt_binary,
+        "apple_live_stt_binary": settings.apple_live_stt_binary,
+        "apple_stt_available": apple_stt_binary_path().exists(),
+        "apple_live_stt_available": apple_live_stt_binary_path().exists(),
         "stt_offline": settings.stt_offline,
         "stt_disable_progress": settings.stt_disable_progress,
         "stt_command_configured": bool(settings.stt_command),
@@ -313,6 +361,9 @@ def normalize_audio(input_path: Path, output_path: Path) -> Path:
 def transcribe_audio(audio_path: Path) -> str:
     configure_stt_environment()
 
+    if settings.stt_provider == "apple":
+        return transcribe_with_apple_speech(audio_path)
+
     if settings.stt_command:
         return run_stt_command(audio_path)
 
@@ -357,6 +408,160 @@ def run_stt_command(audio_path: Path) -> str:
     return proc.stdout.strip()
 
 
+def transcribe_with_apple_speech(audio_path: Path) -> str:
+    helper_path = ensure_apple_stt_helper()
+    locale = speech_locale(settings.stt_language)
+    cmd = [
+        str(helper_path),
+        "--locale",
+        locale,
+        "--timeout",
+        str(settings.apple_stt_timeout),
+        str(audio_path),
+    ]
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=settings.apple_stt_timeout + 10,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "Apple STT failed.").strip()
+        raise HttpError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            f"Apple on-device STT failed for {locale}: {detail}",
+        )
+    return proc.stdout.strip()
+
+
+def ensure_apple_stt_helper() -> Path:
+    helper_path = apple_stt_binary_path()
+    if helper_path.exists():
+        return helper_path
+
+    build_script = ROOT / "scripts" / "build_apple_stt.sh"
+    if not build_script.exists():
+        raise HttpError(HTTPStatus.INTERNAL_SERVER_ERROR, f"Apple STT build script not found: {build_script}")
+
+    proc = subprocess.run(
+        ["bash", str(build_script)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+    if proc.returncode != 0 or not helper_path.exists():
+        detail = (proc.stderr or proc.stdout or "Build failed.").strip()
+        raise HttpError(HTTPStatus.INTERNAL_SERVER_ERROR, f"Could not build Apple STT helper: {detail}")
+    return helper_path
+
+
+def ensure_apple_live_stt_helper() -> Path:
+    helper_path = apple_live_stt_binary_path()
+    if helper_path.exists():
+        return helper_path
+
+    build_script = ROOT / "scripts" / "build_apple_stt.sh"
+    if not build_script.exists():
+        raise HttpError(HTTPStatus.INTERNAL_SERVER_ERROR, f"Apple STT build script not found: {build_script}")
+
+    proc = subprocess.run(
+        ["bash", str(build_script)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+    if proc.returncode != 0 or not helper_path.exists():
+        detail = (proc.stderr or proc.stdout or "Build failed.").strip()
+        raise HttpError(HTTPStatus.INTERNAL_SERVER_ERROR, f"Could not build Apple live STT helper: {detail}")
+    return helper_path
+
+
+def apple_stt_binary_path() -> Path:
+    path = Path(settings.apple_stt_binary)
+    if not path.is_absolute():
+        path = ROOT / path
+    return path
+
+
+def apple_live_stt_binary_path() -> Path:
+    path = Path(settings.apple_live_stt_binary)
+    if not path.is_absolute():
+        path = ROOT / path
+    return path
+
+
+def start_apple_live_stt() -> dict[str, Any]:
+    global live_stt_process
+    helper_path = ensure_apple_live_stt_helper()
+    locale = speech_locale(settings.stt_language)
+
+    with live_stt_lock:
+        if live_stt_process is not None and live_stt_process.poll() is None:
+            return {"ok": True, "already_running": True}
+
+        live_stt_process = subprocess.Popen(
+            [
+                str(helper_path),
+                "--locale",
+                locale,
+                "--timeout",
+                str(settings.apple_live_stt_timeout),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+
+    return {"ok": True, "locale": locale}
+
+
+def stop_apple_live_stt() -> dict[str, Any]:
+    process = current_live_stt_process()
+    if process is None:
+        return {"ok": True, "stopped": False}
+
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=2)
+
+    clear_live_stt_process(process)
+    return {"ok": True, "stopped": True}
+
+
+def current_live_stt_process() -> subprocess.Popen[str] | None:
+    with live_stt_lock:
+        if live_stt_process is None:
+            return None
+        if live_stt_process.poll() is not None:
+            return None
+        return live_stt_process
+
+
+def clear_live_stt_process(process: subprocess.Popen[str]) -> None:
+    global live_stt_process
+    with live_stt_lock:
+        if live_stt_process is process:
+            live_stt_process = None
+
+
+def speech_locale(language: str) -> str:
+    if not language:
+        return "de-DE"
+    if language == "de":
+        return "de-DE"
+    if language == "en":
+        return "en-US"
+    return language
+
+
 def configure_stt_environment() -> None:
     if settings.stt_offline:
         os.environ["HF_HUB_OFFLINE"] = "1"
@@ -367,6 +572,7 @@ def configure_stt_environment() -> None:
 
 
 def ask_ollama(user_text: str) -> str:
+    append_session_log("USER", user_text)
     user_message = build_user_message(user_text)
     messages.append({"role": "user", "content": user_message})
     payload = {
@@ -403,9 +609,29 @@ def ask_ollama(user_text: str) -> str:
         raise HttpError(HTTPStatus.BAD_GATEWAY, f"Ollama returned no assistant text.{hint} Raw: {json.dumps(data)[:800]}")
 
     messages.append({"role": "assistant", "content": assistant_text})
+    append_session_log("ASSISTANT", assistant_text)
     trim_history()
     print_ollama_timing(data, finished - started)
     return assistant_text
+
+
+def append_session_log(role: str, text: str) -> None:
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    normalized = text.strip()
+    if not normalized:
+        return
+
+    with session_log_lock:
+        new_file = not session_log_path.exists()
+        with session_log_path.open("a", encoding="utf-8") as handle:
+            if new_file:
+                handle.write(f"# Local Voice Chat Session\n")
+                handle.write(f"Started: {session_started_at:%Y-%m-%d %H:%M:%S}\n")
+                handle.write(f"Model: {settings.ollama_model}\n\n")
+            handle.write(f"[{timestamp}] {role}\n")
+            handle.write(normalized)
+            handle.write("\n\n")
 
 
 def build_user_message(user_text: str) -> str:
@@ -514,6 +740,7 @@ def main() -> None:
     server, port = bind_server(settings.host, settings.port)
     print(f"Local Voice Chat running at http://{settings.host}:{port}")
     print(f"Ollama: {settings.ollama_base_url} · model: {settings.ollama_model}")
+    print(f"Session log: {session_log_path}")
     server.serve_forever()
 
 
