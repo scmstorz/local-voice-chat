@@ -386,3 +386,4 @@ bei reiner Cache-Prüfung wie ein Download aussehen kann.
 - `GET /api/config`
 - `POST /api/chat` mit JSON `{ "message": "..." }`
 - `POST /api/voice` mit Multipart-Feld `audio`
+
