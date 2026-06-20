@@ -75,7 +75,8 @@ class Settings:
     stt_command: str = os.getenv("STT_COMMAND", "").strip()
     system_prompt: str = os.getenv(
         "SYSTEM_PROMPT",
-        "Du bist ein lokaler Voice-Chat-Assistent. Antworte knapp, direkt und in der Sprache des Nutzers.",
+        "Du bist ein lokaler Voice-Chat-Assistent. Antworte knapp, direkt und in der Sprache des Nutzers. "
+        "Wenn du Deutsch sprichst, duze den Nutzer immer und verwende nie die Sie-Form.",
     )
     tts_voice: str = os.getenv("TTS_VOICE", "").strip()
     tts_rate: str = os.getenv("TTS_RATE", "185")

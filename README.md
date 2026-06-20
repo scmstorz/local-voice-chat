@@ -225,24 +225,24 @@ gestartet wird. Das ist getrennt von der Browser-Mikrofonberechtigung.
 - Die Browser-Mikrofonberechtigung reicht für den Apple-Live-Modus nicht aus.
   Terminal/iTerm/Python braucht ebenfalls Mikrofon- und Speech-Recognition-Rechte.
 
-### English Setup
+### Englisches Setup
 
-For English speech recognition, change `.env`:
+Wenn du englische Spracherkennung nutzen willst, ändere `.env` so:
 
 ```env
 STT_LANGUAGE=en
-SYSTEM_PROMPT=You are a local voice chat assistant. Answer briefly and directly in the user's language. Output only the final answer.
+SYSTEM_PROMPT=You are a local voice chat assistant. Answer briefly and directly in the user's language. If you answer in German, always use informal du and never formal Sie. Output only the final answer.
 ```
 
-`STT_LANGUAGE=en` is mapped internally to `en-US`.
+`STT_LANGUAGE=en` wird intern zu `en-US`.
 
-Check Apple on-device English STT:
+Prüfe danach die lokale englische Apple-STT:
 
 ```bash
 bin/apple_stt --check --locale en-US --timeout 10
 ```
 
-Expected:
+Erwartetes Ergebnis:
 
 ```text
 recognizer=yes locale=en-US available=true
@@ -386,4 +386,3 @@ bei reiner Cache-Prüfung wie ein Download aussehen kann.
 - `GET /api/config`
 - `POST /api/chat` mit JSON `{ "message": "..." }`
 - `POST /api/voice` mit Multipart-Feld `audio`
-
