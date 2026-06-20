@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Local Voice Chat</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="chat-panel" aria-label="Voice Chat">
+        <header class="topbar">
+          <div>
+            <h1>Local Voice Chat</h1>
+            <p id="status">Verbindung wird geprüft...</p>
+          </div>
+          <button id="resetBtn" class="icon-button" type="button" title="Ansicht leeren" aria-label="Ansicht leeren">
+            ↻
+          </button>
+        </header>
+
+        <div id="messages" class="messages" aria-live="polite"></div>
+
+        <form id="textForm" class="composer">
+          <input id="textInput" name="message" autocomplete="off" placeholder="Tippen zum Testen..." />
+          <button id="sendBtn" type="submit">Senden</button>
+        </form>
+
+        <div class="voice-controls">
+          <button id="recordBtn" class="record-button" type="button">
+            <span id="recordDot" class="record-dot"></span>
+            <span id="recordLabel">Gedrückt starten</span>
+          </button>
+          <p id="hint">Sprich nach dem Start. Beim zweiten Klick wird transkribiert und beantwortet.</p>
+        </div>
+      </section>
+    </main>
+
+    <script src="/static/app.js" type="module"></script>
+  </body>
+</html>

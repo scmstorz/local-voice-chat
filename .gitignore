@@ -1,0 +1,17 @@
+.env
+.DS_Store
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Runtime artifacts
+*.wav
+*.aiff
+*.webm
+*.mp3
+*.m4a
+
+# Logs
+*.log

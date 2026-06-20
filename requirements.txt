@@ -1,0 +1,2 @@
+# The web server itself uses only the Python standard library.
+# Install your preferred local STT package separately, for example mlx-whisper.
